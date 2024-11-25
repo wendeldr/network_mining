@@ -1,6 +1,9 @@
 using LinearAlgebra
 using FFTW
 using Statistics
+using JLD2
+using NPZ
+using ProgressMeter
 
 function sinusoidal(a, f, sr, t, theta=0, DC=0)
     delta_i = 1 / sr
@@ -9,23 +12,156 @@ function sinusoidal(a, f, sr, t, theta=0, DC=0)
     return nu
 end
 
-# Optimized zero pad function
-function zero_pad!(data_padded, data)
-    data_padded[1:length(data)] .= data
-    data_padded[length(data)+1:end] .= 0
+function tfr_estimate_size(n_epochs, n_channels, n_taps, n_freqs, n_times)
+    element_size = 16 # bytes for ComplexF64
+    total_elements = n_epochs * n_channels * n_taps * n_freqs * n_times
+    total_bytes = total_elements * element_size
+    total_gb = total_bytes / (1024^3) # Convert bytes to GB
+    return total_gb
 end
 
-function coh(s_xx, s_yy, s_xy)
-    # Compute the numerator: absolute value of the mean of s_xy along the last dimension
-    con_num = abs.(mean(s_xy, dims=ndims(s_xy)))
-
-    # Compute the denominator: square root of the product of means of s_xx and s_yy along the last dimension
-    con_den = sqrt.(mean(s_xx, dims=ndims(s_xx)) .* mean(s_yy, dims=ndims(s_yy)))
-
-    # Calculate coherence as the element-wise division of numerator by denominator
-    coh = con_num ./ con_den
-    return coh
+function weights_estimate_size(n_taps, n_freqs, n_times)
+    element_size = 8 # bytes for Float64
+    total_elements = n_taps * n_freqs * n_times
+    total_bytes = total_elements * element_size
+    total_gb = total_bytes / (1024^3) # Convert bytes to GB
+    return total_gb
 end
+
+function Ws_estimate_size(n_taps, freqs, sfreq, n_cycles)
+    element_size = 16 # bytes for ComplexF64
+    total_elements = 0
+    for k = 1:n_freqs
+        f = freqs[k]
+        t_win = n_cycles / f
+        len_t = Int(ceil(t_win * sfreq))
+        total_elements += n_taps * len_t
+    end
+    total_bytes = total_elements * element_size
+    total_gb = total_bytes / (1024^3) # Convert bytes to GB
+    return total_gb
+end
+
+function fft_estimate_size(a, b, c)
+    element_size = 16 # bytes for ComplexF64
+    total_elements = a * b * c
+    total_bytes = total_elements * element_size
+    total_gb = total_bytes / (1024^3) # Convert bytes to GB
+    return total_gb
+end
+
+function psd_estimate_size(n_epochs, n_channels, n_freqs, n_times)
+    element_size = 8 # bytes for Float64
+    total_elements = n_epochs * n_channels * n_freqs * n_times
+    total_bytes = total_elements * element_size
+    total_gb = total_bytes / (1024^3) # Convert bytes to GB
+    return total_gb
+end
+
+function coh_estimate_size(n_epochs, n_channels, n_freqs)
+    element_size = 8 # bytes for Float64
+    total_elements = n_epochs * n_channels * n_channels * n_freqs
+    total_bytes = total_elements * element_size
+    total_gb = total_bytes / (1024^3) # Convert bytes to GB
+    return total_gb
+end
+
+function scale_dimensions(data, n_taps, freqs, sfreq, n_cycles; print=false, max_gb=0, reserve_gb=0)
+    if max_gb == 0
+        max_gb = Sys.total_memory() / (1024^3) - reserve_gb # Leave 32 GB for other stuff
+    end
+    n_epoch_org, n_channels, n_times = size(data)
+    n_freqs = length(freqs)
+    t_win = n_cycles / minimum(freqs)
+    max_len = Int(ceil(t_win * sfreq))
+    nfft = n_times + max_len - 1
+    nfft = next_fast_len(nfft)
+
+    data_size = Base.summarysize(data) / (1024^3)
+    weights = weights_estimate_size(n_taps, n_freqs, n_times)
+    Ws = Ws_estimate_size(n_taps, freqs, sfreq, n_cycles)
+    coherence_mean = coh_estimate_size(n_epoch_org, n_channels, 1)
+    fft_Ws = fft_estimate_size(n_taps, n_freqs, nfft)
+
+    static_total = data_size + weights + Ws + coherence_mean + fft_Ws
+
+    if static_total >= max_gb
+        println("Static memory exceeds maximum memory")
+        println("Data: $(data_size) GB")
+        println("Weights: $weights GB")
+        println("Ws: $Ws GB")
+        println("Coherence Mean: $coherence_mean GB")
+        println("---------------------------------")
+        println("Total: $static_total GB")
+        println("Exceeds maximum memory limit of $max_gb GB")
+        error("Memory limit exceeded")
+    end
+
+    n_epochs = copy(n_epoch_org)
+    tfr_size = tfr_estimate_size(n_epochs, n_channels, n_taps, n_freqs, n_times)
+    fft_X = fft_estimate_size(n_epochs, n_channels, nfft)
+    psd_per_epoch = psd_estimate_size(n_epochs, n_channels, n_freqs, n_times)
+    coherence = coh_estimate_size(n_epoch_org, n_channels, n_freqs)
+    coherence_mean_small = 0
+
+    dynamic_total = tfr_size + fft_X + psd_per_epoch + coherence + coherence_mean_small
+
+    while dynamic_total + static_total >= max_gb && n_epochs > 0
+        n_epochs -= 1
+        tfr_size = tfr_estimate_size(n_epochs, n_channels, n_taps, n_freqs, n_times)
+        fft_X = fft_estimate_size(n_epochs, n_channels, nfft)
+        psd_per_epoch = psd_estimate_size(n_epochs, n_channels, n_freqs, n_times)
+        coherence = coh_estimate_size(n_epochs, n_channels, n_freqs)
+        coherence_mean_small = coh_estimate_size(n_epochs, n_channels, 1)
+        dynamic_total = tfr_size + fft_X + psd_per_epoch + coherence + coherence_mean_small
+    end
+
+    if n_epochs == 0
+        println("Dynamic memory exceeds maximum memory")
+        println("TFR: $tfr_size GB")
+        println("FFT X: $fft_X GB")
+        println("PSD: $psd_per_epoch GB")
+        println("---------------------------------")
+        println("Total: $dynamic_total GB")
+        println("Exceeds maximum memory limit of $max_gb GB")
+        error("Memory limit exceeded")
+    end
+
+
+    total_size = data_size + weights + Ws + tfr_size + fft_X + fft_Ws + psd_per_epoch + coherence + coherence_mean + coherence_mean_small
+
+    if print
+        println("Can be computed with batches of $n_epochs epochs")
+        println("total batches: $(ceil(n_epoch_org/n_epochs))")
+        println("---------------------------------")
+        println("Data: $(data_size) GB")
+        println("Weights: $weights GB")
+        println("Ws: $Ws GB")
+        println("TFR: $tfr_size GB")
+        println("FFT X: $fft_X GB")
+        println("FFT Ws: $fft_Ws GB")
+        println("PSD: $psd_per_epoch GB")
+        println("Coherence: $coherence GB")
+        println("Coherence Mean: $coherence_mean GB")
+        println("---------------------------------")
+        println("Total: $total_size GB")
+    end
+    return n_epochs
+end
+
+function tril_indices(n)::Array{Tuple{Int,Int},1}
+    pairs = Array{Tuple{Int,Int},1}(undef, n * (n - 1) ÷ 2)
+    q = 1
+    for x in 1:n
+        for y in (x+1):n
+            pairs[q] = (x, y)
+            q += 1
+        end
+    end
+    return pairs
+end
+
+
 
 
 function next_fast_len(target::Int)::Int
@@ -114,84 +250,8 @@ function next_fast_len(target::Int)::Int
     return match
 end
 
-function _get_nfft(Ws, X)::Int
-    max_len = maximum([length(Wk) for Wk in Ws])
-    n = last(size(X))
-    nfft = n + max_len - 1
-    # @show nfft
-    nfft = next_fast_len(nfft)
-    return nfft
-end
-
-# Precompute FFTs of Ws
-function precompute_fft_Ws(Ws, nfft)
-    n_taps, n_freqs = size(Ws)
-    fft_Ws = Array{ComplexF64,3}(undef, n_taps, n_freqs, nfft)
-    for taper_idx = 1:n_taps
-        for freq_idx = 1:n_freqs
-            W = Ws[taper_idx, freq_idx]
-            padded_W = zeros(ComplexF64, nfft)
-            zero_pad!(padded_W, W)
-            fft_Ws[taper_idx, freq_idx, :] = fft(padded_W)
-        end
-    end
-    return fft_Ws
-end
-
-# Precompute FFTs of X
-function precompute_fft_X(X, nfft)
-    n_epochs, n_channels, n_times = size(X)
-    fft_X = Array{ComplexF64,3}(undef, n_epochs, n_channels, nfft)
-    for epoch_idx = 1:n_epochs
-        for channel_idx = 1:n_channels
-            x = X[epoch_idx, channel_idx, :]
-            padded_x = zeros(ComplexF64, nfft)
-            zero_pad!(padded_x, x)
-            fft_X[epoch_idx, channel_idx, :] = fft(padded_x)
-        end
-    end
-    return fft_X
-end
-
-
-# Main function to compute tfr
-function compute_tfr(X, Ws, nfft)
-    n_epochs, n_channels, n_times = size(X)
-    n_taps, n_freqs = size(Ws)
-    tfr = zeros(ComplexF64, n_epochs, n_channels, n_taps, n_freqs, n_times)
-
-    # Precompute FFTs
-    fft_Ws = precompute_fft_Ws(Ws, nfft)
-    fft_X = precompute_fft_X(X, nfft)
-
-    # Loop over tapers and frequencies
-    for taper_idx = 1:n_taps
-        for freq_idx = 1:n_freqs
-            fft_W = fft_Ws[taper_idx, freq_idx, :]
-            W_size = length(Ws[taper_idx, freq_idx])
-            total_size = n_times + W_size - 1
-            ret_size = total_size
-            # Preallocate ret array
-            ret = zeros(ComplexF64, ret_size)
-
-            for epoch_idx = 1:n_epochs
-                for channel_idx = 1:n_channels
-                    fx = fft_X[epoch_idx, channel_idx, :]
-                    product = fx .* fft_W
-                    ret .= ifft(product)[1:ret_size]
-
-                    # Center the result
-                    start = Int(floor((ret_size - n_times) / 2)) + 1
-                    end_time = start + n_times - 1
-                    tfr[epoch_idx, channel_idx, taper_idx, freq_idx, :] = ret[start:end_time]
-                end
-            end
-        end
-    end
-    return tfr, fft_Ws, fft_X
-end
-
-function _extend(M::Int, sym::Bool)::Tuple{Int, Bool}
+### Tapers
+function _extend(M::Int, sym::Bool)::Tuple{Int,Bool}
     # Extend window by 1 sample if needed for DFT-even symmetry
     if !sym
         return M + 1, true
@@ -201,7 +261,7 @@ function _extend(M::Int, sym::Bool)::Tuple{Int, Bool}
 end
 
 
-function _fftautocorr(x::AbstractMatrix{<:Float64})
+function _fftautocorr(x::AbstractMatrix{<:Float64})::Array{Float64, 2}
     """
     tested vs python:
     isapprox(x_fft, py_x_fft, atol=1e-12) == true
@@ -209,18 +269,15 @@ function _fftautocorr(x::AbstractMatrix{<:Float64})
     """
     N = size(x, 2)
     use_N = next_fast_len(2 * N - 1)
-    x_fft = Array{ComplexF64}(undef, size(x, 1), div(use_N, 2) + 1) # rfft returns N/2 + 1 complex numbers
-    padded = zeros(Float64, size(x,1), use_N)
+    padded = zeros(Float64, size(x, 1), use_N)
     padded[:, 1:N] .= x
-    
-    for i = 1:size(x,1)
-        x_fft[i, :] = rfft(@view padded[i, :])
-    end
-    cxy = irfft(x_fft .* conj.(x_fft),use_N,2)[:, 1:N]    
+    plan = plan_rfft(padded, 2)
+    x_fft = plan * padded
+    cxy = irfft(x_fft .* conj.(x_fft), use_N, 2)[:, 1:N]
     return cxy
 end
 
-function py_dpss(M::Int, NW::Float64, normalization_type::Int, Kmax::Int; sym::Bool=true)::Tuple{Array{Complex{Float64}, 2}, Union{Array{Float64, 1}, Float64}}
+function py_dpss(M::Int, NW::Float64, normalization_type::Int, Kmax::Int; sym::Bool=true)::Tuple{Array{Complex{Float64},2},Union{Array{Float64,1},Float64}}
     """
     Compute the Discrete Prolate Spheroidal Sequences (DPSS).
 
@@ -255,9 +312,8 @@ function py_dpss(M::Int, NW::Float64, normalization_type::Int, Kmax::Int; sym::B
         The concentration ratios for the windows. Only returned if
         `return_ratios` evaluates to true. Will be scalar if `Kmax` is nothing.
     """
-
-    known_norms = [1,2,3]
-    if !(normalization_type in known_norms)
+    known_norms = (1, 2, 3)
+    if normalization_type ∉ known_norms
         error("normalization_type must be one of $known_norms, got $normalization_type")
     end
     if Kmax === 1
@@ -266,7 +322,7 @@ function py_dpss(M::Int, NW::Float64, normalization_type::Int, Kmax::Int; sym::B
         singleton = false
     end
     if !(0 < Kmax <= M)
-        error("Kmax must be greater than 0 and less than M")
+        error("Kmax must be greater than 0 and less than or equal to M")
     end
     if NW >= M / 2.0
         error("NW must be less than M/2.")
@@ -274,27 +330,25 @@ function py_dpss(M::Int, NW::Float64, normalization_type::Int, Kmax::Int; sym::B
     if NW <= 0
         error("NW must be positive")
     end
+
     M, needs_trunc = _extend(M, sym)
     W = NW / M
     nidx = collect(0:M-1)
     d = ((M - 1 .- 2 .* nidx) ./ 2.0) .^ 2 .* cos.(2pi * W)
     e = nidx[2:end] .* (M .- nidx[2:end]) ./ 2.0
-    T = Tridiagonal(e, d, e)
+    # Use SymTridiagonal for efficient eigenvalue computation
+    T = SymTridiagonal(d, e)
     eigs = eigen(T)
-    eigvals = eigs.values
-    eigvecs = eigs.vectors
+    # Extract the largest Kmax eigenvalues and eigenvectors
     indices = M-Kmax+1:M
-    eigvals = eigvals[indices]
-    eigvals = reverse(eigvals)
-    eigvecs = eigvecs[end:-1:1, indices];
-    windows = eigvecs[:, end:-1:1]' 
-    # Correct the sign conventions
+    # eigvals = eigs.values[indices] # Unused
+    windows = eigs.vectors[end:-1:1, indices]
+    windows = windows[:, end:-1:1]'
+    # Correct sign conventions
     fix_even = sum(windows[1:2:end, :], dims=2) .< 0
-    for (i, f) in enumerate(fix_even)
-        if f[1]
-            windows[2i-1, :] *= -1
-        end
-    end
+    windows[1:2:end, :][fix_even[:, 1], :] .*= -1
+
+    # # Correct signs for even-indexed windows
     thresh = max(1e-7, 1.0 / M)
     for (i, w) in enumerate(eachrow(windows[2:2:end, :]))
         idx = findfirst(x -> x^2 > thresh, w)
@@ -302,30 +356,33 @@ function py_dpss(M::Int, NW::Float64, normalization_type::Int, Kmax::Int; sym::B
             windows[2i, :] *= -1
         end
     end
-    # compute eigenvalues. 
+
+    # Compute concentration ratios
     dpss_rxx = _fftautocorr(windows)
-    r = 4 * W * sinc.(2 * W .* nidx)
+    r = 4 * W * sinc.(2 * W .* (nidx))
     r[1] = 2 * W
     ratios = dpss_rxx * r
+
     if singleton
         ratios = ratios[1]
     end
-
+    # Apply normalization if needed
     if normalization_type != 1
-        # checked vs python and it is the same
-        windows .= windows ./ maximum(abs.(windows))
+        max_abs = maximum(abs, windows)
+        windows ./= max_abs
         if iseven(M)
             if normalization_type == 2
                 correction = M^2 / (M^2 + NW)
             elseif normalization_type == 3
                 s = rfft(windows[1, :])
-                shift = -(1 - 1.0 / M) .* collect(1:Int(M / 2))
-                s[2:end] .= s[2:end] .* (2 .* exp.(-im * π .* shift))
-                correction = M / sum(real.(s))
+                shift = -(1 - 1.0 / M) .* (1:Int(M / 2))
+                s[2:end] .*= 2 .* exp.(-im * π .* shift)
+                correction = M / sum(real(s))
             end
-            windows .= windows .* correction
+            windows .*= correction
         end
     end
+
     if needs_trunc
         windows = windows[:, 1:end-1]
     end
@@ -335,70 +392,377 @@ function py_dpss(M::Int, NW::Float64, normalization_type::Int, Kmax::Int; sym::B
     return windows, ratios
 end
 
-function compute_tapers(N::Int, n_taps::Int, freqs::AbstractArray{<:Real}, mt_bandwidth::Real, n_cycles::Int, sfreq::Int; zero_mean::Bool=true)
+function compute_tapers(N::Int, n_taps::Int, freqs::AbstractArray{<:Real}, mt_bandwidth::Real, n_cycles::Int, sfreq::Int; zero_mean::Bool=true)::Tuple{Matrix{Vector{ComplexF64}},Array{Float64,3}}
     n_freqs = length(freqs)
-    weights = Array{Float64, 3}(undef, n_taps, n_freqs, N)
+    weights = Array{Float64,3}(undef, n_taps, n_freqs, N)
     Ws = Matrix{Vector{ComplexF64}}(undef, n_taps, n_freqs)
     sp5 = sqrt(0.5)
     # Loop over frequencies first
-    for k in eachindex(freqs)
+    Threads.@threads for k in eachindex(freqs)
         f = freqs[k]
         t_win = n_cycles / f
         len_t = Int(ceil(t_win * sfreq))
-    
+
         t = collect(0:1/sfreq:t_win-(t_win % (1 / sfreq) == 0 ? 1 / sfreq : 0)) # exclude last value if it fits exactly
         t_centered = t .- t_win / 2.0
-    
+
         # Precompute oscillation and taper
         oscillation = exp.(2.0 * im * pi * f .* t_centered)
-    
-        taper,e = py_dpss(len_t, mt_bandwidth / 2, Kmax= n_taps, sym=false, norm=2, return_ratios=true)
+
+        taper, e = py_dpss(len_t, mt_bandwidth / 2, 1, n_taps, sym=false)
         weights[:, k, :] .= sqrt.(e)
-    
+
         for m = 1:n_taps
             # Use @view to avoid copying taper column
             Wk = oscillation .* @view taper[m, :]
-    
+
             if zero_mean  # To make it zero mean
                 real_offset = mean(Wk)
                 Wk .-= real_offset
             end
-    
+
             # Normalize Wk
             Wk /= sp5 * norm(Wk)
-    
+
             # Store Wk in preallocated Ws
             Ws[m, k] = Wk
         end
     end
     return Ws, weights
 end
+### end tapers
 
 
-t = 32
-sr = 32
-f = 2
+function _get_nfft(Ws::AbstractArray{<:ComplexF64}, X::AbstractArray{<:Float64})::Int
+    max_len = maximum([length(Wk) for Wk in Ws])
+    n = last(size(X))
+    nfft = n + max_len - 1
+    # @show nfft
+    nfft = next_fast_len(nfft)
+    return nfft
+end
 
-v = sinusoidal(10, f, sr, t * 4, 0)
-w = sinusoidal(10, f, sr, t * 4, π / 4)
-y = sinusoidal(10, f, sr, t * 4, π / 2)
-z = sinusoidal(10, f, sr, t * 4, π)
 
-data = Array{Float64}(undef, 2, 4, 128)
+function zero_pad!(data_padded::AbstractArray{Float64}, data::AbstractArray{Float64})::AbstractArray{Float64}
+    data_padded[1:length(data)] .= data
+    data_padded[length(data)+1:end] .= 0
+end
 
-data[1, :, :] = hcat(v, w, y, z)'
-data[2, :, :] = hcat(-v, -w, -y, -z)';
+function coh(s_xx::AbstractMatrix{Float64}, s_yy::AbstractMatrix{Float64}, s_xy::AbstractMatrix{ComplexF64})::Array{Float64}
+    # Compute the numerator: absolute value of the mean of s_xy along the last dimension
+    con_num = abs.(mean(s_xy, dims=ndims(s_xy)))
 
-freqs = collect(2:15) # inclusive of end 
+    # Compute the denominator: square root of the product of means of s_xx and s_yy along the last dimension
+    con_den = sqrt.(mean(s_xx, dims=ndims(s_xx)) .* mean(s_yy, dims=ndims(s_yy)))
+
+    # Calculate coherence as the element-wise division of numerator by denominator
+    coh = con_num ./ con_den
+    return coh
+end
+
+
+
+
+# Precompute FFTs of Ws
+function precompute_fft_Ws(Ws, nfft)
+    n_taps, n_freqs = size(Ws)
+    fft_Ws = Array{ComplexF64,3}(undef, n_taps, n_freqs, nfft)
+    for taper_idx = 1:n_taps
+        for freq_idx = 1:n_freqs
+            W = Ws[taper_idx, freq_idx]
+            padded_W = zeros(ComplexF64, nfft)
+            zero_pad!(padded_W, W)
+            fft_Ws[taper_idx, freq_idx, :] = fft(padded_W)
+        end
+    end
+    return fft_Ws
+end
+
+# Precompute FFTs of X
+function precompute_fft_X(X, nfft)
+    n_epochs, n_channels, n_times = size(X)
+    fft_X = Array{ComplexF64,3}(undef, n_epochs, n_channels, nfft)
+    for epoch_idx = 1:n_epochs
+        for channel_idx = 1:n_channels
+            x = X[epoch_idx, channel_idx, :]
+            padded_x = zeros(ComplexF64, nfft)
+            zero_pad!(padded_x, x)
+            fft_X[epoch_idx, channel_idx, :] = fft(padded_x)
+        end
+    end
+    return fft_X
+end
+
+
+# Main function to compute tfr
+function compute_tfr(X::AbstractArray{<:Float64}, fft_Ws::AbstractArray{ComplexF64}, Ws_lengths::Array{Int}, nfft::Int)::Array{ComplexF64,5}
+    n_epochs, n_channels, n_times = size(X)
+    n_taps, n_freqs = size(Ws)
+    tfr = Array{ComplexF64,5}(undef, n_epochs, n_channels, n_taps, n_freqs, n_times)
+
+    # # Precompute FFTs
+    # println("Precomputing FFTs of X...")
+    # fft_X = precompute_fft_X(X, nfft)
+    # println("Done!")
+
+    # @showprogress Threads.@threads for taper_idx = 1:n_taps
+    #     for freq_idx = 1:n_freqs
+    #         fft_W = @view fft_Ws[taper_idx, freq_idx, :]
+    #         W_size = Ws_lengths[taper_idx, freq_idx]
+    #         total_size = n_times + W_size - 1
+    #         ret_size = total_size
+
+    #         for epoch_idx = 1:n_epochs
+    #             for channel_idx = 1:n_channels
+    #                 fx = @view fft_X[epoch_idx, channel_idx, :]
+    #                 product = fx .* fft_W
+    #                 ret = ifft(product)[1:ret_size]
+
+    #                 # Center the result
+    #                 start = Int(floor((ret_size - n_times) / 2)) + 1
+    #                 end_time = start + n_times - 1
+    #                 tfr[epoch_idx, channel_idx, taper_idx, freq_idx, :] = ret[start:end_time]
+    #             end
+    #         end
+    #     end
+    # end
+
+    # @showprogress desc="Computing TFRs" Threads.@threads for idx in 1:(n_taps*n_freqs*n_epochs*n_channels)
+    #     # Compute indices from idx
+    #     taper_idx = ((idx - 1) ÷ (n_freqs * n_epochs * n_channels)) + 1
+    #     rem1 = (idx - 1) % (n_freqs * n_epochs * n_channels)
+    #     freq_idx = (rem1 ÷ (n_epochs * n_channels)) + 1
+    #     rem2 = rem1 % (n_epochs * n_channels)
+    #     epoch_idx = (rem2 ÷ n_channels) + 1
+    #     channel_idx = (rem2 % n_channels) + 1
+
+    #     fft_W = @view fft_Ws[taper_idx, freq_idx, :]
+    #     W_size = Ws_lengths[taper_idx, freq_idx]
+    #     total_size = n_times + W_size - 1
+    #     ret_size = total_size
+
+    #     fx = @view fft_X[epoch_idx, channel_idx, :]
+    #     product = fx .* fft_W
+    #     ret = ifft(product)[1:ret_size]
+
+    #     # # # Center the result
+    #     start = Int(floor((ret_size - n_times) / 2)) + 1
+    #     end_time = start + n_times - 1
+    #     tfr[epoch_idx, channel_idx, taper_idx, freq_idx, :] = ret[start:end_time]
+
+    # end
+
+
+    return tfr
+end
+
+
+
+
+
+# t = 32
+# sr = 32
+# f = 2
+
+# v = sinusoidal(10, f, sr, t * 4, 0)
+# w = sinusoidal(10, f, sr, t * 4, π / 4)
+# y = sinusoidal(10, f, sr, t * 4, π / 2)
+# z = sinusoidal(10, f, sr, t * 4, π)
+
+# data = Array{Float64}(undef, 2, 4, 128)
+
+# data[1, :, :] = hcat(v, w, y, z)'
+# data[2, :, :] = hcat(-v, -w, -y, -z)';
+
+# freqs = collect(2:15) # inclusive of end 
+# n_freqs = length(freqs)
+# mt_bandwidth = 4
+# n_taps = floor(Int, mt_bandwidth - 1)
+# n_cycles = 7
+# sfreq = 32
+# zero_mean = true
+
+
+outputpath = "/media/dan/Data/git/network_mining/connectivity/julia_test/"
+data = npzread("/media/dan/Data/git/network_mining/connectivity/julia_test/034_input.npy")
+sfreq = 2048
+freqs = collect(14:1023)
+zero_mean = true
 n_freqs = length(freqs)
 mt_bandwidth = 4
 n_taps = floor(Int, mt_bandwidth - 1)
 n_cycles = 7
-sfreq = 32
-zero_mean = true
+n_epochs, n_channels, n_times = size(data)
+
+batch_size = scale_dimensions(data, n_taps, freqs, sfreq, n_cycles, print=false, reserve_gb=16)
+total_batches = ceil(n_epochs / batch_size)
+if batch_size != n_epochs
+    println("Data is too big for one pass!\nData will be computed in batches of $batch_size epochs. Total batches: $(total_batches)")
+end
 
 
-ProfileView.@profview compute_tapers(size(data,ndims(data)), n_taps, freqs, mt_bandwidth, n_cycles, sfreq)
+println("Making tapers...")
+Ws, weights = compute_tapers(n_times, n_taps, freqs, mt_bandwidth, n_cycles, sfreq)
+normalization = 2 ./ sum(real(weights .* conj(weights)), dims=1);
 
-# Ws, weights = compute_tapers(size(data,ndims(data)), n_taps, freqs, mt_bandwidth, n_cycles, sfreq)
 
+fft_Ws = precompute_fft_Ws(Ws, _get_nfft(Ws, data));
+Ws_lengths = [length(Wk) for Wk in Ws]
+println("Done!")
+
+println("Preparing for computation...")
+pairs = tril_indices(n_channels)
+n_pairs = length(pairs)
+
+coherence_mean = Array{Float64,4}(undef, n_epochs, n_channels, n_channels, 1)
+for b = 1:total_batches
+    println("Batch $(Int(b))/$(Int(total_batches)) ...")
+    start_idx = Int((b - 1) * batch_size + 1)
+    end_idx = Int(min(b * batch_size, n_epochs))
+    data_batch = data[start_idx:end_idx, :, :]
+    e, c, t = size(data_batch)
+    # @show e, c, t
+    tfrs = compute_tfr(data_batch, fft_Ws, Ws_lengths, _get_nfft(Ws, data_batch))
+
+    # psd_per_epoch = Array{Float64,4}(undef, e, c, n_freqs, t)
+    # @showprogress desc = "Computing epoch's PSD..." for epoch_idx = 1:e
+
+    #     # Perform the element-wise multiplication with broadcasting
+    #     psd = weights .* tfrs[epoch_idx, :, :, :, :]
+
+    #     # Square magnitude (complex conjugate multiplication)
+    #     psd = psd .* conj(psd)
+
+    #     # Sum across the second dimension (axis=1 in Python)
+    #     psd = sum(real(psd), dims=2)
+    #     psd = psd .* psd_normalization
+
+    #     psd_per_epoch[epoch_idx, :, :, :] .= psd[:, 1, :, :]
+    # end
+
+
+    psd_per_epoch = Array{Float64,4}(undef, e, n_channels, n_freqs, n_times)
+    # @showprogress desc = "Computing epoch's PSD..." Threads.@threads for idx = 1:(e*n_channels)
+    #     # Compute epoch_idx and c_idx from idx
+    #     epoch_idx = div(idx - 1, n_channels) + 1
+    #     c_idx = mod(idx - 1, n_channels) + 1
+
+    #     # Perform the element-wise multiplication with broadcasting
+    #     psd = weights .* @view tfrs[epoch_idx, c_idx, :, :, :]
+
+    #     # Square magnitude (complex conjugate multiplication)
+    #     psd .= psd .* conj(psd)
+
+    #     # Sum across the first dimension (tapers)
+    #     psd = sum(real(psd), dims=1)
+
+    #     # Apply the normalization
+    #     psd .= psd .* normalization
+
+    #     # Update the psd_per_epoch array
+    #     psd_per_epoch[epoch_idx, c_idx, :, :] .= psd[1, :, :]
+    # end
+
+    coherence = Array{Float64,4}(undef, e, c, c, n_freqs)
+    @showprogress desc = "Computing Coherence..." Threads.@threads for idx in 1:e*n_pairs
+        # Calculate the epoch index and pair index
+        epoch_idx = div(idx - 1, n_pairs) + 1
+        pair_idx = mod(idx - 1, n_pairs) + 1
+        x, y = pairs[pair_idx]
+        # println("Epoch: $epoch_idx, Pair: ($x, $y)")
+        # Now perform your operations
+        w_x = @view tfrs[epoch_idx, x, :, :, :]
+        w_y = @view tfrs[epoch_idx, y, :, :, :]
+        s_xy = sum(weights .* w_x .* conj(weights .* w_y), dims=1)  # sum over tapers
+        s_xy = s_xy .* normalization
+
+        s_xx = @view psd_per_epoch[epoch_idx, x, :, :]
+        s_yy = @view psd_per_epoch[epoch_idx, y, :, :]
+        coh_value = coh(s_xx, s_yy, s_xy[1, :, :])
+
+        # Copy to symmetric position
+        coherence[epoch_idx, y, x, :] .= coh_value
+    end
+
+    # @showprogress desc = "Computing epoch's coh..." Threads.@threads for epoch_idx = 1:e
+    #     @showprogress Threads.@threads for x = 1:c
+    #         @showprogress Threads.@threads for y = (x+1):c  # Skip diagonal and only calculate for lower triangle
+    #             w_x = tfrs[epoch_idx, x, :, :, :]
+    #             w_y = tfrs[epoch_idx, y, :, :, :]
+    #             s_xy = sum(weights .* w_x .* conj(weights .* w_y), dims=1)  # sum over tapers
+
+    #             s_xy = s_xy .* normalization
+
+    #             s_xx = psd_per_epoch[epoch_idx, x, :, :]
+    #             s_yy = psd_per_epoch[epoch_idx, y, :, :]
+
+    #             coh_value = coh(s_xx, s_yy, s_xy[1, :, :])
+    #             # coherence[epoch_idx, x, y, :] .= coh_value # Copy to symmetric position
+    #             coherence[epoch_idx, y, x, :] .= coh_value
+    #         end
+    #     end
+    # end
+    coherence_mean[start_idx:end_idx, :, :, :] .= mean(coherence, dims=ndims(coherence))
+
+end
+println("Saving...")
+save(joinpath(outputpath, "034_coherence.jld2"), "coherence_mean", coherence_mean)
+println("Done saving!")
+
+
+# println("Starting tfrs...")
+# tfrs, fft_Ws, fft_X = compute_tfr(data, Ws, _get_nfft(Ws, data));
+# println("Done tfrs!")
+
+# println("Starting psd_per_epoch...")
+# psd_per_epoch = zeros(size(data, 1), size(data, 2), size(weights, 2), size(data, 3));
+# # Calculate normalization factor for `weights`
+# normalization = 2 ./ sum(real(weights .* conj(weights)), dims=2)
+
+# @showprogress Threads.@threads for epoch_idx = 1:size(data, 1)
+#     # Perform the element-wise multiplication with broadcasting
+#     psd = weights .* tfrs[epoch_idx, :, :, :, :]
+
+#     # Square magnitude (complex conjugate multiplication)
+#     psd = psd .* conj(psd)
+
+#     # Sum across the second dimension (axis=1 in Python)
+#     psd = sum(real(psd), dims=2)
+
+#     psd = psd .* normalization
+#     # @show size(psd)
+
+#     psd_per_epoch[epoch_idx, :, :, :] .= psd[:, 1, :, :]
+# end
+# println("Done psd_per_epoch!")
+
+
+# println("Starting coherence...")
+# coherence = zeros(size(data, 1), size(data, 2), size(data, 2), size(psd_per_epoch, 3))
+
+# @showprogress Threads.@threads for epoch_idx = 1:size(data, 1)
+#     @showprogress Threads.@threads for x = 1:size(data, 2)
+#         @showprogress Threads.@threads for y = (x+1):size(data, 2)  # Skip diagonal and only calculate for lower triangle
+#             w_x = tfrs[epoch_idx, x, :, :, :]
+#             w_y = tfrs[epoch_idx, y, :, :, :]
+#             s_xy = sum(weights[1, :, :, :] .* w_x .* conj(weights[1, :, :, :] .* w_y), dims=1)  # sum over tapers
+#             normalization = 2 ./ sum(real(weights[1, :, :, :] .* conj(weights[1, :, :, :])), dims=1)
+#             s_xy = s_xy .* normalization
+
+#             s_xx = psd_per_epoch[epoch_idx, x, :, :]
+#             s_yy = psd_per_epoch[epoch_idx, y, :, :]
+
+#             coh_value = coh(s_xx, s_yy, s_xy[1, :, :])
+#             # coherence[epoch_idx, x, y, :] .= coh_value # Copy to symmetric position
+#             coherence[epoch_idx, y, x, :] .= coh_value
+#         end
+#     end
+# end
+# # println("Done coherence!")
+# # coherence_mean = mean(coherence, dims=ndims(coherence));
+# # println("Done coherence_mean!")
+
+# # # save to file
+# # println("Saving...")
+# # save(joinpath(outputpath,"034_coherence.jld2"), "coherence", coherence)
+# # println("Done saving!")

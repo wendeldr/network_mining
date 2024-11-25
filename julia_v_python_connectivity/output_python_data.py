@@ -26,7 +26,7 @@ def _centered(arr, newsize):
     myslice = [slice(startind[k], endind[k]) for k in range(len(endind))]
     return arr[tuple(myslice)]
 #
-output_path = "/media/dan/Data/git/network_miner/julia_v_python_connectivity/python_outputs"
+output_path = "/media/dan/Data/git/network_mining/julia_v_python_connectivity/python_outputs"
 
 # fully clear the output directory
 import shutil
