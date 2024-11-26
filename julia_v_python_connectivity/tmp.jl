@@ -598,27 +598,67 @@ end
 #     return tfr
 # end
 
-function compute_psd(batch_size::Int, n_channels::Int, n_freqs::Int, n_times::Int, tfrs::Array{ComplexF64,5}, weights::Array{Float64,3}, normalization::Array{Float64, 3})::Array{Float64,4}
-    psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times)
-    @showprogress desc = "Computing epoch's PSD..." Threads.@threads for idx = 1:(batch_size*n_channels)
-        # Compute epoch_idx and c_idx from idx
+# function compute_psd(batch_size::Int, n_channels::Int, n_freqs::Int, n_times::Int, tfrs::Array{ComplexF64,5}, weights::Array{Float64,3}, normalization::Array{Float64, 3})::Array{Float64,4}
+#     psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times)
+#     @showprogress desc = "Computing epoch's PSD..." Threads.@threads for idx = 1:(batch_size*n_channels)
+#         # Compute epoch_idx and c_idx from idx
+#         epoch_idx = div(idx - 1, n_channels) + 1
+#         c_idx = mod(idx - 1, n_channels) + 1
+
+#         # Perform the element-wise multiplication with broadcasting
+#         psd = weights .* @view tfrs[epoch_idx, c_idx, :, :, :]
+
+#         # Square magnitude (complex conjugate multiplication)
+#         psd .= psd .* conj(psd)
+
+#         # Sum across the first dimension (tapers)
+#         psd = sum(real(psd), dims=1)
+
+#         # Apply the normalization
+#         psd .= psd .* normalization
+
+#         # Update the psd_per_epoch array
+#         psd_per_epoch[epoch_idx, c_idx, :, :] .= psd[1, :, :]
+#     end
+#     return psd_per_epoch
+# end
+
+function compute_psd!(psd_per_epoch::Array{Float64,4}, tfrs::Array{ComplexF64,5}, weights::Array{Float64,3}, normalization::Array{Float64, 2})::Array{Float64,4}
+    batch_size, n_channels, n_tapers, n_freqs, n_times = size(tfrs)
+
+    nthreads = Threads.nthreads()
+    psd_arrays = [Array{ComplexF64}(undef, n_tapers, n_freqs, n_times) for _ in 1:nthreads]
+    psd_sums = [Array{Float64}(undef, n_freqs, n_times) for _ in 1:nthreads]
+
+    @inbounds @showprogress desc="Computing epoch's PSD..." for idx = 1:(batch_size * n_channels)
+        thread_id = Threads.threadid()
+        psd = psd_arrays[thread_id]
+        psd_sum = psd_sums[thread_id]
+
+        # Compute epoch_idx and channel_idx from idx
         epoch_idx = div(idx - 1, n_channels) + 1
         c_idx = mod(idx - 1, n_channels) + 1
 
-        # Perform the element-wise multiplication with broadcasting
-        psd = weights .* @view tfrs[epoch_idx, c_idx, :, :, :]
+        # Extract the current tfr slice
+        tfr_view = @view tfrs[epoch_idx, c_idx, :, :, :]
 
-        # Square magnitude (complex conjugate multiplication)
-        psd .= psd .* conj(psd)
+        # Perform the element-wise multiplication
+        @. psd = weights * tfr_view
+
+        # Compute the squared magnitude
+        @. psd = psd * conj(psd)
 
         # Sum across the first dimension (tapers)
-        psd = sum(real(psd), dims=1)
+        psd_sum .= 0.0
+        @inbounds for t = 1:n_tapers
+            @views psd_sum .= psd_sum .+ real(psd[t, :, :])
+        end
 
         # Apply the normalization
-        psd .= psd .* normalization
+        @. psd_sum = psd_sum * normalization
 
         # Update the psd_per_epoch array
-        psd_per_epoch[epoch_idx, c_idx, :, :] .= psd[1, :, :]
+        psd_per_epoch[epoch_idx, c_idx, :, :] .= psd_sum
     end
     return psd_per_epoch
 end
@@ -694,6 +734,8 @@ println("Making tapers...")
 Ws, weights = compute_tapers(n_times, n_taps, freqs, mt_bandwidth, n_cycles, sfreq)
 
 normalization = 2 ./ sum(real(weights .* conj(weights)), dims=1);
+small_norm = dropdims(normalization; dims=1)
+
 nfft = _get_nfft(Ws, data)
 
 println("Precomputing FFTs of tapers and data...")
@@ -714,7 +756,7 @@ b=1
 
 
 tfr = Array{ComplexF64,5}(undef, batch_size, n_channels, n_taps, n_freqs, n_times);
-batch_size, n_channels, n_taps, n_freqs, n_times = size(tfr)
+compute_tfr!(tfr, fft_X, fft_Ws, Ws_lengths);
 
-
-compute_tfr!(tfr, fft_X, fft_Ws, Ws_lengths)
+psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times);
+compute_psd1!(psd_per_epoch, tfr, weights, small_norm);
