@@ -26,27 +26,37 @@ def _centered(arr, newsize):
     myslice = [slice(startind[k], endind[k]) for k in range(len(endind))]
     return arr[tuple(myslice)]
 #
-output_path = "/media/dan/Data/git/network_mining/julia_v_python_connectivity/python_outputs"
+# output_path = "/media/dan/Data/git/network_mining/julia_v_python_connectivity/python_outputs"
+output_path = "/media/dan/Data/git/network_mining/julia_v_python_connectivity/non_simulated_data/python_outputs"
 
 # fully clear the output directory
 import shutil
 shutil.rmtree(output_path, ignore_errors=True)
 os.makedirs(output_path, exist_ok=True)
 
-t=32
-sr=32
-f=2
-freqs=np.arange(2,16)
+# t=32
+# sr=32
+# f=2
+# freqs=np.arange(2,16)
+# faverage=True
+# method=['coh']
+# mode="multitaper"
+
+# # make fake data in shape of (epoch, channel, time)
+# v=sinusoidal(10, f, sr, t*4, 0)
+# w=sinusoidal(10, f, sr, t*4, np.pi/4)
+# y=sinusoidal(10, f, sr, t*4, np.pi/2)
+# z=sinusoidal(10, f, sr, t*4, np.pi)
+# data = np.array([[v, w, y, z],[-v, -w, -y, -z]])
+
+data = np.load("/media/dan/Data/git/network_mining/connectivity/julia_test/034_input.npy")
+data = data[0:1, :, :] # shape (epoch, channel, time) only using first epoch atm
+sr = 2048
+freqs=np.arange(14,sr//2)
 faverage=True
 method=['coh']
 mode="multitaper"
 
-# make fake data in shape of (epoch, channel, time)
-v=sinusoidal(10, f, sr, t*4, 0)
-w=sinusoidal(10, f, sr, t*4, np.pi/4)
-y=sinusoidal(10, f, sr, t*4, np.pi/2)
-z=sinusoidal(10, f, sr, t*4, np.pi)
-data = np.array([[v, w, y, z],[-v, -w, -y, -z]])
 
 # save data to file
 np.save(os.path.join(output_path,"data.npy"), data)
