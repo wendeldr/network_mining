@@ -32,7 +32,7 @@ end
 function Ws_estimate_size(n_taps, freqs, sfreq, n_cycles)
     element_size = 16 # bytes for ComplexF64
     total_elements = 0
-    for k = 1:n_freqs
+    for k in eachindex(freqs)
         f = freqs[k]
         t_win = n_cycles / f
         len_t = Int(ceil(t_win * sfreq))
@@ -511,7 +511,7 @@ end
 function precompute_fft_X(X, nfft)
     n_epochs, n_channels, n_times = size(X)
     fft_X = zeros(ComplexF64,n_epochs, n_channels, nfft)
-    fft_X[:,:,1:n_times] .= data
+    fft_X[:,:,1:n_times] .= X
     p = plan_fft!(fft_X, 3)
     return p * fft_X
 end
@@ -599,7 +599,7 @@ function compute_psd!(psd_per_epoch::Array{Float64,4}, tfrs::Array{ComplexF64,5}
 end
 
 function compute_coh_mean!(coherence::Array{Float64,4}, tfrs::Array{ComplexF64,5}, pairs::Vector{Tuple{Int64, Int64}}, psd_per_epoch::Array{Float64,4}, weights_squared::Array{Float64,3}, normalization::Array{Float64, 2})::Array{Float64,4}
-    batch_size, n_channels, n_taps, n_freqs, n_times = size(tfr)
+    batch_size, n_channels, n_taps, n_freqs, n_times = size(tfrs)
     n_pairs = length(pairs)
 
     nthreads = Threads.nthreads()
@@ -639,21 +639,15 @@ function compute_coh_mean!(coherence::Array{Float64,4}, tfrs::Array{ComplexF64,5
     return mean(coherence, dims=ndims(coherence))
 end
 
-input_path = "/media/dan/Data/git/network_mining/connectivity/julia_test"
-outputpath = "/media/dan/Data/git/network_mining/connectivity/julia_test"
 
-to_run = ["034_epochs_winmsec-000500_overlap-000000.npy",
-          "047_epochs_winmsec-000500_overlap-000000.npy",
-          "091_epochs_winmsec-000500_overlap-000000.npy"]
-
-for file in to_run
+function run(file::String,input_path::String)::Nothing
     println("Running $(joinpath(input_path, file))")
-
     file_id = file[1:3]
     
     data = npzread(joinpath(input_path, file))
+    data = data[1:2,1:4,:]
     sfreq = 2048
-    freqs = collect(14:250)
+    freqs = collect(14:30)
     zero_mean = true
     n_freqs = length(freqs)
     mt_bandwidth = 4
@@ -704,4 +698,17 @@ for file in to_run
     println("Saving...")
     save(joinpath(outputpath, "$(file_id)_coherence.jld2"), "coherence_mean", coherence_mean)
     println("Done saving!")
+end
+
+
+
+input_path = "/media/dan/Data/git/network_mining/connectivity/julia_test"
+outputpath = "/media/dan/Data/git/network_mining/connectivity/julia_test"
+
+to_run = ["034_epochs_winmsec-000500_overlap-000000.npy",
+          "047_epochs_winmsec-000500_overlap-000000.npy",
+          "091_epochs_winmsec-000500_overlap-000000.npy"]
+
+for file in to_run
+    run(file, input_path)
 end
