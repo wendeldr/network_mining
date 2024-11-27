@@ -687,6 +687,8 @@ function compute_coh_mean(epochs::Int, n_channels::Int, n_freqs::Int, n_pairs::I
     return mean(coherence, dims=ndims(coherence))
 end
 
+
+
 # t = 32
 # sr = 32
 # f = 2
@@ -712,10 +714,10 @@ end
 
 outputpath = "/media/dan/Data/git/network_mining/connectivity/julia_test/"
 data = npzread("/media/dan/Data/git/network_mining/connectivity/julia_test/034_input.npy")
-data = data[1:2, 1:10, :]
+data = data[1:2, :, :]
 
 sfreq = 2048
-freqs = collect(14:50)
+freqs = collect(14:250)
 zero_mean = true
 n_freqs = length(freqs)
 mt_bandwidth = 4
@@ -732,6 +734,7 @@ end
 
 println("Making tapers...")
 Ws, weights = compute_tapers(n_times, n_taps, freqs, mt_bandwidth, n_cycles, sfreq)
+weights_squared = weights .^ 2
 
 normalization = 2 ./ sum(real(weights .* conj(weights)), dims=1);
 small_norm = dropdims(normalization; dims=1)
@@ -759,4 +762,51 @@ tfr = Array{ComplexF64,5}(undef, batch_size, n_channels, n_taps, n_freqs, n_time
 compute_tfr!(tfr, fft_X, fft_Ws, Ws_lengths);
 
 psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times);
-compute_psd1!(psd_per_epoch, tfr, weights, small_norm);
+compute_psd!(psd_per_epoch, tfr, weights, small_norm);
+
+
+
+
+coherence = Array{Float64,4}(undef, batch_size, n_channels, n_channels, n_freqs)
+
+function compute_coh!(coherence::Array{Float64,4}, tfrs::Array{ComplexF64,5}, pairs::Vector{Tuple{Int64, Int64}}, psd_per_epoch::Array{Float64,4}, weights_squared::Array{Float64,3}, normalization::Array{Float64, 2})::Array{Float64,4}
+    batch_size, n_channels, n_taps, n_freqs, n_times = size(tfr)
+    n_pairs = length(pairs)
+
+    nthreads = Threads.nthreads()
+    temp_arrays = [Array{ComplexF64,3}(undef, n_taps, n_freqs, n_times) for _ in 1:nthreads]
+    @showprogress desc = "Computing Coherence..." Threads.@threads for idx in 1:batch_size*n_pairs
+        thread_id = Threads.threadid()
+        temp = temp_arrays[thread_id]
+
+        # Calculate the epoch index and pair index
+        epoch_idx = div(idx - 1, n_pairs) + 1
+        pair_idx = mod(idx - 1, n_pairs) + 1
+        x, y = pairs[pair_idx]
+        # println("Epoch: $epoch_idx, Pair: ($x, $y)")
+        # Now perform your operations
+        w_x = @view tfrs[epoch_idx, x, :, :, :]
+        w_y = @view tfrs[epoch_idx, y, :, :, :]
+        temp .= weights_squared .* w_x .* conj.(w_y)
+        s_xy = dropdims(sum(temp, dims=1),dims=1)  # sum over tapers
+        s_xy .*= normalization
+
+        s_xx = @view psd_per_epoch[epoch_idx, x, :, :]
+        s_yy = @view psd_per_epoch[epoch_idx, y, :, :]
+
+        # Compute the numerator: absolute value of the mean of s_xy along the last dimension
+        con_num = abs.(mean(s_xy, dims=2))
+
+        # Compute the denominator: square root of the product of means of s_xx and s_yy along the last dimension
+        con_den = sqrt.(mean(s_xx, dims=2) .* mean(s_yy, dims=2))
+
+        # Calculate coherence as the element-wise division of numerator by denominator
+        coh_value = con_num ./ con_den
+        # coh_value = coh(s_xx, s_yy, s_xy[1, :, :])
+
+        # Copy to symmetric position
+        coherence[epoch_idx, y, x, :] .= coh_value
+    end
+    return mean(coherence, dims=ndims(coherence))
+end
+compute_coh!(coherence, tfr, pairs, psd_per_epoch, weights_squared, small_norm)

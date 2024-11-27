@@ -661,83 +661,24 @@ n_pairs = length(pairs)
 tfr = Array{ComplexF64,5}(undef, batch_size, n_channels, n_taps, n_freqs, n_times); # make outside loop/function and modify in place
 
 
-
-
-b=1
+# b=1
 coherence_mean = Array{Float64,4}(undef, n_epochs, n_channels, n_channels, 1)
-# for b = 1:total_batches
-#     println("Batch $(Int(b))/$(Int(total_batches)) ...")
+for b = 1:total_batches
+    println("Batch $(Int(b))/$(Int(total_batches)) ...")
     start_idx = Int((b - 1) * batch_size + 1)
     end_idx = Int(min(b * batch_size, n_epochs))
     data_batch = @view fft_X[start_idx:end_idx, :, :];
 
-    # tfrs = compute_tfr(data_batch, fft_Ws, Ws_lengths, n_times)
+    tfrs = compute_tfr(data_batch, fft_Ws, Ws_lengths, n_times)
 
-    # psd_per_epoch = compute_psd(batch_size, n_channels, n_freqs, n_times, tfrs, weights, normalization)
-
-
-
-    # coherence_mean[start_idx:end_idx, :, :, :] .= compute_coh_mean(batch_size, n_channels, n_freqs, n_pairs, tfrs, psd_per_epoch, weights, normalization)
-
-# end
-# println("Saving...")
-# save(joinpath(outputpath, "034_coherence.jld2"), "coherence_mean", coherence_mean)
-# println("Done saving!")
+    psd_per_epoch = compute_psd(batch_size, n_channels, n_freqs, n_times, tfrs, weights, normalization)
 
 
-# println("Starting tfrs...")
-# tfrs, fft_Ws, fft_X = compute_tfr(data, Ws, _get_nfft(Ws, data));
-# println("Done tfrs!")
 
-# println("Starting psd_per_epoch...")
-# psd_per_epoch = zeros(size(data, 1), size(data, 2), size(weights, 2), size(data, 3));
-# # Calculate normalization factor for `weights`
-# normalization = 2 ./ sum(real(weights .* conj(weights)), dims=2)
+    coherence_mean[start_idx:end_idx, :, :, :] .= compute_coh_mean(batch_size, n_channels, n_freqs, n_pairs, tfrs, psd_per_epoch, weights, normalization)
 
-# @showprogress Threads.@threads for epoch_idx = 1:size(data, 1)
-#     # Perform the element-wise multiplication with broadcasting
-#     psd = weights .* tfrs[epoch_idx, :, :, :, :]
+end
+println("Saving...")
+save(joinpath(outputpath, "034_coherence.jld2"), "coherence_mean", coherence_mean)
+println("Done saving!")
 
-#     # Square magnitude (complex conjugate multiplication)
-#     psd = psd .* conj(psd)
-
-#     # Sum across the second dimension (axis=1 in Python)
-#     psd = sum(real(psd), dims=2)
-
-#     psd = psd .* normalization
-#     # @show size(psd)
-
-#     psd_per_epoch[epoch_idx, :, :, :] .= psd[:, 1, :, :]
-# end
-# println("Done psd_per_epoch!")
-
-
-# println("Starting coherence...")
-# coherence = zeros(size(data, 1), size(data, 2), size(data, 2), size(psd_per_epoch, 3))
-
-# @showprogress Threads.@threads for epoch_idx = 1:size(data, 1)
-#     @showprogress Threads.@threads for x = 1:size(data, 2)
-#         @showprogress Threads.@threads for y = (x+1):size(data, 2)  # Skip diagonal and only calculate for lower triangle
-#             w_x = tfrs[epoch_idx, x, :, :, :]
-#             w_y = tfrs[epoch_idx, y, :, :, :]
-#             s_xy = sum(weights[1, :, :, :] .* w_x .* conj(weights[1, :, :, :] .* w_y), dims=1)  # sum over tapers
-#             normalization = 2 ./ sum(real(weights[1, :, :, :] .* conj(weights[1, :, :, :])), dims=1)
-#             s_xy = s_xy .* normalization
-
-#             s_xx = psd_per_epoch[epoch_idx, x, :, :]
-#             s_yy = psd_per_epoch[epoch_idx, y, :, :]
-
-#             coh_value = coh(s_xx, s_yy, s_xy[1, :, :])
-#             # coherence[epoch_idx, x, y, :] .= coh_value # Copy to symmetric position
-#             coherence[epoch_idx, y, x, :] .= coh_value
-#         end
-#     end
-# end
-# # println("Done coherence!")
-# # coherence_mean = mean(coherence, dims=ndims(coherence));
-# # println("Done coherence_mean!")
-
-# # # save to file
-# # println("Saving...")
-# # save(joinpath(outputpath,"034_coherence.jld2"), "coherence", coherence)
-# # println("Done saving!")
