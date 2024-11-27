@@ -122,14 +122,14 @@ function scale_dimensions(data, n_taps, freqs, sfreq, n_cycles; print=false, max
     coherence = coh_estimate_size(n_epoch_org, n_channels, n_freqs)
     coherence_mean_small = 0
     
-    dynamic_total = tfr_size + psd_per_epoch + coherence + coherence_mean_small    
+    dynamic_total = tfr_size + psd_per_epoch + coherence + coherence_mean_small + 10 # 10gb overhead
     while dynamic_total + static_total >= max_gb && n_epochs > 0
         n_epochs -= 1
         tfr_size = tfr_estimate_size(n_epochs, n_channels, n_taps, n_freqs, n_times)
         psd_per_epoch = psd_estimate_size(n_epochs, n_channels, n_freqs, n_times)
         coherence = coh_estimate_size(n_epochs, n_channels, n_freqs)
         coherence_mean_small = coh_estimate_size(n_epochs, n_channels, 1)
-        dynamic_total = tfr_size + psd_per_epoch + coherence + coherence_mean_small
+        dynamic_total = tfr_size + psd_per_epoch + coherence + coherence_mean_small + 10 # 10gb overhead
     end
 
     if n_epochs == 0
@@ -539,8 +539,8 @@ function compute_tfr!(tfr::Array{ComplexF64, 5}, fft_X::Array{ComplexF64, 3}, ff
         # Loop over tapers
         for taper_idx = 1:n_taps
             fft_W = fft_Ws[taper_idx, freq_idx, :]  # Current fft_W
-            Ws_length = Ws_lengths[taper_idx, freq_idx]
-            ret_size = n_times + Ws_length - 1
+            # Ws_length = Ws_lengths[taper_idx, freq_idx]
+            # ret_size = n_times + Ws_length - 1
             
             # Compute start and end indices for slicing
             start = start_indices[taper_idx, freq_idx]
@@ -565,7 +565,7 @@ function compute_psd!(psd_per_epoch::Array{Float64,4}, tfrs::Array{ComplexF64,5}
     psd_arrays = [Array{ComplexF64}(undef, n_tapers, n_freqs, n_times) for _ in 1:nthreads]
     psd_sums = [Array{Float64}(undef, n_freqs, n_times) for _ in 1:nthreads]
 
-    @inbounds @showprogress desc="Computing epoch(s) PSD(s)..." for idx = 1:(batch_size * n_channels)
+    @inbounds @showprogress desc="Computing epoch(s) PSD(s)..." Threads.@threads for idx = 1:(batch_size * n_channels)
         thread_id = Threads.threadid()
         psd = psd_arrays[thread_id]
         psd_sum = psd_sums[thread_id]
@@ -639,60 +639,69 @@ function compute_coh_mean!(coherence::Array{Float64,4}, tfrs::Array{ComplexF64,5
     return mean(coherence, dims=ndims(coherence))
 end
 
+input_path = "/media/dan/Data/git/network_mining/connectivity/julia_test"
+outputpath = "/media/dan/Data/git/network_mining/connectivity/julia_test"
 
-outputpath = "/media/dan/Data/git/network_mining/connectivity/julia_test/"
-data = npzread("/media/dan/Data/git/network_mining/connectivity/julia_test/034_input.npy")
-sfreq = 2048
-freqs = collect(14:250)
-zero_mean = true
-n_freqs = length(freqs)
-mt_bandwidth = 4
-n_taps = floor(Int, mt_bandwidth - 1)
-n_cycles = 7
-n_epochs, n_channels, n_times = size(data)
+to_run = ["034_epochs_winmsec-000500_overlap-000000.npy",
+          "047_epochs_winmsec-000500_overlap-000000.npy",
+          "091_epochs_winmsec-000500_overlap-000000.npy"]
 
-batch_size = scale_dimensions(data, n_taps, freqs, sfreq, n_cycles, print=true, reserve_gb=60)
-total_batches = ceil(Int,n_epochs / batch_size)
-if batch_size != n_epochs
-    println("Data is too big for one pass!\nData will be computed in batches of $batch_size epochs. Total batches: $(total_batches)")
+for file in to_run
+    println("Running $(joinpath(input_path, file))")
+
+    file_id = file[1:3]
+    
+    data = npzread(joinpath(input_path, file))
+    sfreq = 2048
+    freqs = collect(14:250)
+    zero_mean = true
+    n_freqs = length(freqs)
+    mt_bandwidth = 4
+    n_taps = floor(Int, mt_bandwidth - 1)
+    n_cycles = 7
+    n_epochs, n_channels, n_times = size(data)
+
+    batch_size = scale_dimensions(data, n_taps, freqs, sfreq, n_cycles, print=true, reserve_gb=50)
+    total_batches = ceil(Int,n_epochs / batch_size)
+    if batch_size != n_epochs
+        println("Data is too big for one pass!\nData will be computed in batches of $batch_size epochs. Total batches: $(total_batches)")
+    end
+
+
+    println("Making tapers...")
+    Ws, weights = compute_tapers(n_times, n_taps, freqs, mt_bandwidth, n_cycles, sfreq)
+    weights_squared = weights .^ 2
+    normalization = 2 ./ sum(real(weights .* conj(weights)), dims=1);
+    small_norm = dropdims(normalization; dims=1)
+
+    nfft = _get_nfft(Ws, data)
+
+    println("Precomputing FFTs of tapers and data...")
+    fft_Ws = precompute_fft_Ws(Ws, nfft);
+    fft_X = precompute_fft_X(data, nfft);
+    println("Done!")
+
+    # save(joinpath(outputpath, "034_pretasks.jld2"), "Ws", Ws, "weights", weights, "fft_Ws", fft_Ws, "fft_X", fft_X, "normalization", normalization)
+
+    Ws_lengths = [length(Wk) for Wk in Ws]
+
+    println("Preparing for computation...")
+    pairs = tril_indices(n_channels)
+    n_pairs = length(pairs)
+    tfr = Array{ComplexF64,5}(undef, batch_size, n_channels, n_taps, n_freqs, n_times);
+    psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times);
+    coherence = Array{Float64,4}(undef, batch_size, n_channels, n_channels, n_freqs)
+    coherence_mean = Array{Float64,4}(undef, n_epochs, n_channels, n_channels, 1)
+    for b = 1:total_batches
+        println("Batch $(Int(b))/$(Int(total_batches)) ...")
+        start_idx = Int((b - 1) * batch_size + 1)
+        end_idx = Int(min(b * batch_size, n_epochs))
+        data_batch = fft_X[start_idx:end_idx, :, :];
+        compute_tfr!(tfr, data_batch, fft_Ws, Ws_lengths);
+        compute_psd!(psd_per_epoch, tfr, weights, small_norm);
+        coherence_mean[start_idx:end_idx, :, :, :] .= compute_coh_mean!(coherence, tfr, pairs, psd_per_epoch, weights_squared, small_norm)
+    end
+    println("Saving...")
+    save(joinpath(outputpath, "$(file_id)_coherence.jld2"), "coherence_mean", coherence_mean)
+    println("Done saving!")
 end
-
-
-println("Making tapers...")
-Ws, weights = compute_tapers(n_times, n_taps, freqs, mt_bandwidth, n_cycles, sfreq)
-weights_squared = weights .^ 2
-normalization = 2 ./ sum(real(weights .* conj(weights)), dims=1);
-small_norm = dropdims(normalization; dims=1)
-
-nfft = _get_nfft(Ws, data)
-
-println("Precomputing FFTs of tapers and data...")
-fft_Ws = precompute_fft_Ws(Ws, nfft);
-fft_X = precompute_fft_X(data, nfft);
-println("Done!")
-
-# save(joinpath(outputpath, "034_pretasks.jld2"), "Ws", Ws, "weights", weights, "fft_Ws", fft_Ws, "fft_X", fft_X, "normalization", normalization)
-
-Ws_lengths = [length(Wk) for Wk in Ws]
-
-println("Preparing for computation...")
-pairs = tril_indices(n_channels)
-n_pairs = length(pairs)
-tfr = Array{ComplexF64,5}(undef, batch_size, n_channels, n_taps, n_freqs, n_times);
-psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times);
-coherence = Array{Float64,4}(undef, batch_size, n_channels, n_channels, n_freqs)
-coherence_mean = Array{Float64,4}(undef, n_epochs, n_channels, n_channels, 1)
-for b = 1:total_batches
-    println("Batch $(Int(b))/$(Int(total_batches)) ...")
-    start_idx = Int((b - 1) * batch_size + 1)
-    end_idx = Int(min(b * batch_size, n_epochs))
-    data_batch = @view fft_X[start_idx:end_idx, :, :];
-    compute_tfr!(tfr, data_batch, fft_Ws, Ws_lengths);
-    compute_psd!(psd_per_epoch, tfr, weights, small_norm);
-    psd_per_epoch = compute_psd(batch_size, n_channels, n_freqs, n_times, tfrs, weights, normalization)
-    coherence_mean[start_idx:end_idx, :, :, :] .= compute_coh_mean!(coherence, tfr, pairs, psd_per_epoch, weights_squared, small_norm)
-end
-println("Saving...")
-save(joinpath(outputpath, "034_coherence.jld2"), "coherence_mean", coherence_mean)
-println("Done saving!")
-
