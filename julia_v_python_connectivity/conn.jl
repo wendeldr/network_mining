@@ -477,17 +477,17 @@ function _get_nfft(Ws::Matrix{Vector{ComplexF64}}, X::AbstractArray{<:Float64}):
     return nfft
 end
 
-function coh(s_xx::AbstractMatrix{Float64}, s_yy::AbstractMatrix{Float64}, s_xy::AbstractMatrix{ComplexF64})::Array{Float64}
-    # Compute the numerator: absolute value of the mean of s_xy along the last dimension
-    con_num = abs.(mean(s_xy, dims=ndims(s_xy)))
+# function coh(s_xx::AbstractMatrix{Float64}, s_yy::AbstractMatrix{Float64}, s_xy::AbstractMatrix{ComplexF64})::Array{Float64}
+#     # Compute the numerator: absolute value of the mean of s_xy along the last dimension
+#     con_num = abs.(mean(s_xy, dims=ndims(s_xy)))
 
-    # Compute the denominator: square root of the product of means of s_xx and s_yy along the last dimension
-    con_den = sqrt.(mean(s_xx, dims=ndims(s_xx)) .* mean(s_yy, dims=ndims(s_yy)))
+#     # Compute the denominator: square root of the product of means of s_xx and s_yy along the last dimension
+#     con_den = sqrt.(mean(s_xx, dims=ndims(s_xx)) .* mean(s_yy, dims=ndims(s_yy)))
 
-    # Calculate coherence as the element-wise division of numerator by denominator
-    coh = con_num ./ con_den
-    return coh
-end
+#     # Calculate coherence as the element-wise division of numerator by denominator
+#     coh = con_num ./ con_den
+#     return coh
+# end
 
 
 # Precompute FFTs of Ws
@@ -516,68 +516,98 @@ function precompute_fft_X(X, nfft)
     return p * fft_X
 end
 
-# Main function to compute tfr
-function compute_tfr!(tfr::Array{ComplexF64, 5}, fft_X::Array{ComplexF64, 3}, fft_Ws::Array{ComplexF64, 3}, Ws_lengths::Array{Int64, 2})::Array{ComplexF64,5}
-    batch_size, n_channels, n_taps, n_freqs, n_times = size(tfr)
-
-    # @showprogress desc="Computing TFRs" Threads.@threads for idx in 1:(n_taps*n_freqs*batch_size*n_channels)
-    @showprogress desc="Computing TFRs" for idx in 1:(n_taps*n_freqs*batch_size*n_channels)
-        # Compute indices from idx
-        # @show idx
-        taper_idx = ((idx - 1) ÷ (n_freqs * batch_size * n_channels)) + 1
-        rem1 = (idx - 1) % (n_freqs * batch_size * n_channels)
-        freq_idx = (rem1 ÷ (batch_size * n_channels)) + 1
-        rem2 = rem1 % (batch_size * n_channels)
-        epoch_idx = (rem2 ÷ n_channels) + 1
-        channel_idx = (rem2 % n_channels) + 1
-
-        fft_W = @view fft_Ws[taper_idx, freq_idx, :]
-        W_size = Ws_lengths[taper_idx, freq_idx]
-        total_size = n_times + W_size - 1
-        ret_size = total_size
-
-        fx = @view fft_X[epoch_idx, channel_idx, :]
-        product = fx .* fft_W
-        ret = ifft(product)[1:ret_size]
-
-        # # # Center the result
-        start = Int(floor((ret_size - n_times) / 2)) + 1
-        end_time = start + n_times - 1
-        tfr[epoch_idx, channel_idx, taper_idx, freq_idx, :] .= ret[start:end_time]
-
+function compute_tfr!(tfr::Array{ComplexF64, 5}, fft_X::Array{ComplexF64, 3}, fft_Ws::Array{ComplexF64, 3}, Ws_lengths::Array{Int64, 2})
+    batch_size, n_channels, nfft = size(fft_X)
+    n_taps, n_freqs, _ = size(fft_Ws)
+    _, _, _, _, n_times = size(tfr)
+    
+    # Precompute sizes, start_indices, and end_indices
+    sizes = n_times .+ Ws_lengths .- 1
+    start_indices = floor.(Int, (sizes .- n_times) ./ 2) .+ 1
+    end_indices = start_indices .+ n_times .- 1
+    
+    nthreads = Threads.nthreads()
+    temp_arrays = [Array{ComplexF64}(undef, batch_size, n_channels, nfft) for _ in 1:nthreads]
+    fft_plans = [plan_ifft!(temp_arrays[i], 3) for i in 1:nthreads]
+    
+    # Thread over frequencies
+    @inbounds @showprogress desc="Computing TFRs" Threads.@threads for freq_idx = 1:n_freqs
+        thread_id = Threads.threadid()
+        temp = temp_arrays[thread_id]
+        ifft_plan = fft_plans[thread_id]
+        
+        # Loop over tapers
+        for taper_idx = 1:n_taps
+            fft_W = fft_Ws[taper_idx, freq_idx, :]  # Current fft_W
+            Ws_length = Ws_lengths[taper_idx, freq_idx]
+            ret_size = n_times + Ws_length - 1
+            
+            # Compute start and end indices for slicing
+            start = start_indices[taper_idx, freq_idx]
+            end_time = end_indices[taper_idx, freq_idx]
+            
+            # Compute the product and inverse FFT in-place
+            temp .= fft_X .* reshape(fft_W, 1, 1, nfft)  # Broadcasting over first two dims
+            temp .= ifft_plan * temp  # In-place inverse FFT
+            
+            # Assign the centered result to tfr
+            tfr[:, :, taper_idx, freq_idx, :] .= temp[:, :, start:end_time]
+        end
     end
-
+    
     return tfr
 end
 
-function compute_psd(batch_size::Int, n_channels::Int, n_freqs::Int, n_times::Int, tfrs::Array{ComplexF64,5}, weights::Array{Float64,3}, normalization::Array{Float64, 3})::Array{Float64,4}
-    psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times)
-    @showprogress desc = "Computing epoch's PSD..." Threads.@threads for idx = 1:(batch_size*n_channels)
-        # Compute epoch_idx and c_idx from idx
+function compute_psd!(psd_per_epoch::Array{Float64,4}, tfrs::Array{ComplexF64,5}, weights::Array{Float64,3}, normalization::Array{Float64, 2})::Array{Float64,4}
+    batch_size, n_channels, n_tapers, n_freqs, n_times = size(tfrs)
+
+    nthreads = Threads.nthreads()
+    psd_arrays = [Array{ComplexF64}(undef, n_tapers, n_freqs, n_times) for _ in 1:nthreads]
+    psd_sums = [Array{Float64}(undef, n_freqs, n_times) for _ in 1:nthreads]
+
+    @inbounds @showprogress desc="Computing epoch(s) PSD(s)..." for idx = 1:(batch_size * n_channels)
+        thread_id = Threads.threadid()
+        psd = psd_arrays[thread_id]
+        psd_sum = psd_sums[thread_id]
+
+        # Compute epoch_idx and channel_idx from idx
         epoch_idx = div(idx - 1, n_channels) + 1
         c_idx = mod(idx - 1, n_channels) + 1
 
-        # Perform the element-wise multiplication with broadcasting
-        psd = weights .* @view tfrs[epoch_idx, c_idx, :, :, :]
+        # Extract the current tfr slice
+        tfr_view = @view tfrs[epoch_idx, c_idx, :, :, :]
 
-        # Square magnitude (complex conjugate multiplication)
-        psd .= psd .* conj(psd)
+        # Perform the element-wise multiplication
+        @. psd = weights * tfr_view
+
+        # Compute the squared magnitude
+        @. psd = psd * conj(psd)
 
         # Sum across the first dimension (tapers)
-        psd = sum(real(psd), dims=1)
+        psd_sum .= 0.0
+        @inbounds for t = 1:n_tapers
+            @views psd_sum .= psd_sum .+ real(psd[t, :, :])
+        end
 
         # Apply the normalization
-        psd .= psd .* normalization
+        @. psd_sum = psd_sum * normalization
 
         # Update the psd_per_epoch array
-        psd_per_epoch[epoch_idx, c_idx, :, :] .= psd[1, :, :]
+        psd_per_epoch[epoch_idx, c_idx, :, :] .= psd_sum
     end
     return psd_per_epoch
 end
 
-function compute_coh_mean(epochs::Int, n_channels::Int, n_freqs::Int, n_pairs::Int, tfrs::Array{ComplexF64,5}, psd_per_epoch::Array{Float64,4}, weights::Array{Float64,3}, normalization::Array{Float64, 3})::Array{Float64,4}
-    coherence = Array{Float64,4}(undef, epochs, n_channels, n_channels, n_freqs)
-    @showprogress desc = "Computing Coherence..." Threads.@threads for idx in 1:epochs*n_pairs
+function compute_coh_mean!(coherence::Array{Float64,4}, tfrs::Array{ComplexF64,5}, pairs::Vector{Tuple{Int64, Int64}}, psd_per_epoch::Array{Float64,4}, weights_squared::Array{Float64,3}, normalization::Array{Float64, 2})::Array{Float64,4}
+    batch_size, n_channels, n_taps, n_freqs, n_times = size(tfr)
+    n_pairs = length(pairs)
+
+    nthreads = Threads.nthreads()
+    temp_arrays = [Array{ComplexF64,3}(undef, n_taps, n_freqs, n_times) for _ in 1:nthreads]
+    @inbounds @showprogress desc = "Computing Coherence..." Threads.@threads for idx in 1:batch_size*n_pairs
+        thread_id = Threads.threadid()
+        temp = temp_arrays[thread_id]
+
         # Calculate the epoch index and pair index
         epoch_idx = div(idx - 1, n_pairs) + 1
         pair_idx = mod(idx - 1, n_pairs) + 1
@@ -586,12 +616,22 @@ function compute_coh_mean(epochs::Int, n_channels::Int, n_freqs::Int, n_pairs::I
         # Now perform your operations
         w_x = @view tfrs[epoch_idx, x, :, :, :]
         w_y = @view tfrs[epoch_idx, y, :, :, :]
-        s_xy = sum(weights .* w_x .* conj(weights .* w_y), dims=1)  # sum over tapers
-        s_xy = s_xy .* normalization
+        temp .= weights_squared .* w_x .* conj.(w_y)
+        s_xy = dropdims(sum(temp, dims=1),dims=1)  # sum over tapers
+        s_xy .*= normalization
 
         s_xx = @view psd_per_epoch[epoch_idx, x, :, :]
         s_yy = @view psd_per_epoch[epoch_idx, y, :, :]
-        coh_value = coh(s_xx, s_yy, s_xy[1, :, :])
+
+        # Compute the numerator: absolute value of the mean of s_xy along the last dimension
+        con_num = abs.(mean(s_xy, dims=2))
+
+        # Compute the denominator: square root of the product of means of s_xx and s_yy along the last dimension
+        con_den = sqrt.(mean(s_xx, dims=2) .* mean(s_yy, dims=2))
+
+        # Calculate coherence as the element-wise division of numerator by denominator
+        coh_value = con_num ./ con_den
+        # coh_value = coh(s_xx, s_yy, s_xy[1, :, :])
 
         # Copy to symmetric position
         coherence[epoch_idx, y, x, :] .= coh_value
@@ -599,33 +639,11 @@ function compute_coh_mean(epochs::Int, n_channels::Int, n_freqs::Int, n_pairs::I
     return mean(coherence, dims=ndims(coherence))
 end
 
-# t = 32
-# sr = 32
-# f = 2
-
-# v = sinusoidal(10, f, sr, t * 4, 0)
-# w = sinusoidal(10, f, sr, t * 4, π / 4)
-# y = sinusoidal(10, f, sr, t * 4, π / 2)
-# z = sinusoidal(10, f, sr, t * 4, π)
-
-# data = Array{Float64}(undef, 2, 4, 128)
-
-# data[1, :, :] = hcat(v, w, y, z)'
-# data[2, :, :] = hcat(-v, -w, -y, -z)';
-
-# freqs = collect(2:15) # inclusive of end 
-# n_freqs = length(freqs)
-# mt_bandwidth = 4
-# n_taps = floor(Int, mt_bandwidth - 1)
-# n_cycles = 7
-# sfreq = 32
-# zero_mean = true
-
 
 outputpath = "/media/dan/Data/git/network_mining/connectivity/julia_test/"
 data = npzread("/media/dan/Data/git/network_mining/connectivity/julia_test/034_input.npy")
 sfreq = 2048
-freqs = collect(14:1023)
+freqs = collect(14:250)
 zero_mean = true
 n_freqs = length(freqs)
 mt_bandwidth = 4
@@ -634,7 +652,7 @@ n_cycles = 7
 n_epochs, n_channels, n_times = size(data)
 
 batch_size = scale_dimensions(data, n_taps, freqs, sfreq, n_cycles, print=true, reserve_gb=60)
-total_batches = ceil(n_epochs / batch_size)
+total_batches = ceil(Int,n_epochs / batch_size)
 if batch_size != n_epochs
     println("Data is too big for one pass!\nData will be computed in batches of $batch_size epochs. Total batches: $(total_batches)")
 end
@@ -642,8 +660,10 @@ end
 
 println("Making tapers...")
 Ws, weights = compute_tapers(n_times, n_taps, freqs, mt_bandwidth, n_cycles, sfreq)
-
+weights_squared = weights .^ 2
 normalization = 2 ./ sum(real(weights .* conj(weights)), dims=1);
+small_norm = dropdims(normalization; dims=1)
+
 nfft = _get_nfft(Ws, data)
 
 println("Precomputing FFTs of tapers and data...")
@@ -658,25 +678,19 @@ Ws_lengths = [length(Wk) for Wk in Ws]
 println("Preparing for computation...")
 pairs = tril_indices(n_channels)
 n_pairs = length(pairs)
-tfr = Array{ComplexF64,5}(undef, batch_size, n_channels, n_taps, n_freqs, n_times); # make outside loop/function and modify in place
-
-
-# b=1
+tfr = Array{ComplexF64,5}(undef, batch_size, n_channels, n_taps, n_freqs, n_times);
+psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times);
+coherence = Array{Float64,4}(undef, batch_size, n_channels, n_channels, n_freqs)
 coherence_mean = Array{Float64,4}(undef, n_epochs, n_channels, n_channels, 1)
 for b = 1:total_batches
     println("Batch $(Int(b))/$(Int(total_batches)) ...")
     start_idx = Int((b - 1) * batch_size + 1)
     end_idx = Int(min(b * batch_size, n_epochs))
     data_batch = @view fft_X[start_idx:end_idx, :, :];
-
-    tfrs = compute_tfr(data_batch, fft_Ws, Ws_lengths, n_times)
-
+    compute_tfr!(tfr, data_batch, fft_Ws, Ws_lengths);
+    compute_psd!(psd_per_epoch, tfr, weights, small_norm);
     psd_per_epoch = compute_psd(batch_size, n_channels, n_freqs, n_times, tfrs, weights, normalization)
-
-
-
-    coherence_mean[start_idx:end_idx, :, :, :] .= compute_coh_mean(batch_size, n_channels, n_freqs, n_pairs, tfrs, psd_per_epoch, weights, normalization)
-
+    coherence_mean[start_idx:end_idx, :, :, :] .= compute_coh_mean!(coherence, tfr, pairs, psd_per_epoch, weights_squared, small_norm)
 end
 println("Saving...")
 save(joinpath(outputpath, "034_coherence.jld2"), "coherence_mean", coherence_mean)

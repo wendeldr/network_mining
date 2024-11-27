@@ -726,7 +726,7 @@ n_cycles = 7
 n_epochs, n_channels, n_times = size(data)
 
 batch_size = scale_dimensions(data, n_taps, freqs, sfreq, n_cycles, print=true, reserve_gb=60)
-total_batches = ceil(n_epochs / batch_size)
+total_batches = ceil(Int,n_epochs / batch_size)
 if batch_size != n_epochs
     println("Data is too big for one pass!\nData will be computed in batches of $batch_size epochs. Total batches: $(total_batches)")
 end
@@ -759,7 +759,7 @@ b=1
 
 
 tfr = Array{ComplexF64,5}(undef, batch_size, n_channels, n_taps, n_freqs, n_times);
-compute_tfr!(tfr, fft_X, fft_Ws, Ws_lengths);
+
 
 psd_per_epoch = Array{Float64,4}(undef, batch_size, n_channels, n_freqs, n_times);
 compute_psd!(psd_per_epoch, tfr, weights, small_norm);
@@ -769,7 +769,7 @@ compute_psd!(psd_per_epoch, tfr, weights, small_norm);
 
 coherence = Array{Float64,4}(undef, batch_size, n_channels, n_channels, n_freqs)
 
-function compute_coh!(coherence::Array{Float64,4}, tfrs::Array{ComplexF64,5}, pairs::Vector{Tuple{Int64, Int64}}, psd_per_epoch::Array{Float64,4}, weights_squared::Array{Float64,3}, normalization::Array{Float64, 2})::Array{Float64,4}
+function compute_coh_mean!(coherence::Array{Float64,4}, tfrs::Array{ComplexF64,5}, pairs::Vector{Tuple{Int64, Int64}}, psd_per_epoch::Array{Float64,4}, weights_squared::Array{Float64,3}, normalization::Array{Float64, 2})::Array{Float64,4}
     batch_size, n_channels, n_taps, n_freqs, n_times = size(tfr)
     n_pairs = length(pairs)
 
